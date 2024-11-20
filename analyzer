@@ -1,0 +1,1132 @@
+ _________________________________1.Импорт_________________________________
+
+import os
+import re
+import fitz
+import spacy
+# import MainApp
+import pymorphy3
+
+from datetime import datetime
+
+# from ISKP_new.settings import BASE_DIR
+# from MainApp.models import *
+
+
+# _________________________________2.Переменные_________________________________
+
+
+# Счетчик обязанностей
+duties_counter = 0
+# Массив названий органа. Заполняется из базы
+db_array = []
+# Тип объекта органа, к которому относится документ
+dut_o_boss_type = None
+# Название НПА
+fname = None
+# Тип НПА из названия
+doc_type_duty = None
+# Подписной номер НПА
+fnumber = None
+# Дата вступления в силу НПА
+fdate = None
+# Актуальность НПА
+factual = None
+# Уровень НПА
+flevel = None
+# Вид НПА
+fdtype = None
+# Массив обязанностей из PDF
+array_duties = []
+array_duties_count = 0
+# Ответственный орган из PDF
+document_o_name = ""
+moduls_doc = {}
+
+
+# ___________________________3.Функции выделения отдельных абзацев____________________________
+
+# # Цвета для вывода результатов №2 - в консоль.
+# class Bcolors:
+#     OKGREEN = '\033[92m'
+#     YELLOW = '\033[93m'
+#     RED = '\033[31m'
+#     ENDC = '\033[0m'
+#     UND = '\033[4m'
+#     BOLD = '\033[1m'
+#     CYAN = '\033[96m'  # {Bcolors.CYAN}{....}{Bcolors.ENDC}
+
+
+# Дополнение нумерации обязанностей
+def responsibilities(text_from_key_resp: str):
+    # Итоговый список обязанностей
+    Duties_r = []
+    # Подсчёт добавления обязанности в "Duties_resp", кроме одной и той же подобязанности
+    count_ur = 1
+    # Счетчик номера подобязанности
+    count_pr = 0
+    # Счетчик номера выявленного текста обязанности
+    count_ppr = 1
+    # Счетчик уровня обязанности
+    count_deep = 1
+    # Счётчик выявления паттернов
+    count_pattern = 0
+    # Счётчик добавления в Duties_r
+    count_append = 0
+    # Создание списков для хранения результатов последнего распознавания по шаблону
+    # Список с шапкой обязанности
+    duti_r = []
+    # Список с подобязанностью с буквой в номере
+    duti_prl = []
+    # Список с подобязанностью без буквы в номере
+    duti_pr = []
+    # Список с текстом обязанности без буквы в нумерации
+    duti_ppr = []
+    # Список с текстом обязанности с буквой в нумерации
+    duti_pprl = []
+    for match in re.finditer(
+            r'(?P<Duti_other>.+осуществляет также иные.+)|'
+            r'(?P<Duti_r>(?P<Duti_r_number>[0-9]+(\.[0-9]+)?)\)\s?(?P<Duti_r_not_number>.+:))|'
+            r'(?P<Duti_r_next>(?P<Duti_r_next_number>[0-9]+(\.[0-9]+)?)\)\s?(?P<Duti_r_next_not_number>.+[;.]))|'
+            r'(?P<Duti_prl>(?P<Duti_pr_letter>[а-я])\).+:)+|'
+            r'(?P<Duti_pprl>(?P<Duti_ppr_letter>[а-я])\).+[;.])+|'
+            r'(?P<Duti_ppr>-?.+[;.])+', text_from_key_resp):
+        # Поиск обязанностей
+        if match["Duti_r"] or match["Duti_r_next"]:
+            # Обнуляется уровень обязанности
+            count_pattern += 1
+            count_deep = 1
+            # Номер обязанности, текст обязанности, номер выявленного паттерна, уровень обязанности
+            if match["Duti_r"]:
+                duti_r = [match["Duti_r_number"], match["Duti_r_not_number"][:-1], count_pattern, count_deep]
+            # Если обязанность без пунктов, т.е. после этой будет сразу следующая обязанность
+            elif match["Duti_r_next"]:
+                duti_r = [match["Duti_r_next_number"], match["Duti_r_next_not_number"][:-1], count_pattern, count_deep]
+                count_append += 1
+                # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                Duties_r.append([duti_r[0], duti_r[1], duti_r[2], duti_r[3], count_append])
+            count_ur = 0
+            count_pr = 1
+            count_ppr = 1
+        # Поиск подобязанностей
+        elif match["Duti_prl"] or match["Duti_pr"]:
+            count_pattern += 1
+            count_deep = 2
+            if match["Duti_prl"]:
+                # Номер обязанности, буква из документа, текст подобязанности,
+                # номер выявленного паттерна, уровень подобязанности
+                duti_prl = [duti_r[0], match["Duti_pr_letter"], match["Duti_prl"][3:-1], count_pattern, count_deep]
+            elif match["Duti_pr"]:
+                count_ur += 1
+                # Номер обязанности, номер подобязанности, текст подобязанности,
+                # номер выявленного паттерна, уровень подобязанности
+                duti_pr = [duti_r[0], count_ur, match["Duti_pr"][1:-1], count_pattern, count_deep]
+            count_pr += 1
+            count_ppr = 1
+        # Поиск текста обязанностей
+        elif match["Duti_ppr"] or match["Duti_pprl"]:
+            count_append += 1
+            # Если последний распознанный паттерн - обязанность
+            if duti_r and duti_r[-2] == count_pattern:
+                count_deep = 2
+                count_pattern += 1
+                # Если текст обязанности без буквы в номере
+                if match["Duti_ppr"]:
+                    count_ur += 1
+                    # Номер обязанности, номер текста обязанности, шапка обязанности, текст обязанности,
+                    # номер распознанного паттерна, уровень обязанности
+                    duti_ppr = [duti_r[0], count_ur, duti_r[1], match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append(
+                        [duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3], duti_ppr[4], duti_ppr[5], count_append])
+                elif match["Duti_pprl"]:
+                    # Номер обязанности, буква из документа, шапка обязанности, текст обязанности,
+                    # номер распознанного паттерна, уровень обязанности
+                    duti_pprl = [duti_r[0], match['Duti_ppr_letter'], duti_r[1],
+                                 match["Duti_pprl"][3:-1], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append([duti_pprl[0], duti_pprl[1], duti_pprl[2], duti_pprl[3],
+                                     duti_pprl[4], duti_pprl[5], count_append])
+            # Если последний распознанный паттерн - подобязанность с буквой в номере
+            elif duti_prl and duti_prl[-2] == count_pattern:
+                count_deep = 3
+                count_pattern += 1
+                # Номер обязанности, буква из документа, номер текста обязанности, шапка обязанности,
+                # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                duti_ppr = [duti_r[0], duti_prl[1], count_ppr, duti_r[1], duti_prl[2],
+                            match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                Duties_r.append([duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3], duti_ppr[4],
+                                 duti_ppr[5], duti_ppr[6], duti_ppr[7], count_append])
+                count_ppr += 1
+            # Если последний распознанный паттерн - подобязанность без буквы в номере
+            elif duti_pr and duti_pr[-2] == count_pattern:
+                count_deep = 3
+                count_pattern += 1
+                if match["Duti_ppr"]:
+                    # Номер обязанности, номер подобязанности, номер текста обязанности, шапка обязанности,
+                    # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                    duti_ppr = [duti_r[0], duti_pr[1], count_ppr, duti_r[1], duti_pr[2],
+                                match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append([duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3],
+                                     duti_ppr[4], duti_ppr[5], duti_ppr[6], duti_ppr[7], count_append])
+                    count_ppr += 1
+                elif match["Duti_pprl"]:
+                    # Номер обязанности, номер подобязанности, буква из документа, шапка обязанности,
+                    # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                    duti_pprl = [duti_r[0], duti_pr[1], match["Duti_ppr_letter"], duti_r[1], duti_pr[2],
+                                 match["Duti_pprl"][3:], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append([duti_pprl[0], duti_pprl[1], duti_pprl[2], duti_pprl[3],
+                                     duti_pprl[4], duti_pprl[5], duti_pprl[6], duti_pprl[7], count_append])
+            # Если последний распознанный паттерн - текст обязанности без буквы в номере
+            elif duti_ppr and duti_ppr[-2] == count_pattern:
+                count_pattern += 1
+                # Если текст обязанности без буквы в номере
+                if match["Duti_ppr"]:
+                    count_deep = duti_ppr[-1]
+                    if count_deep == 3:
+                        # Если подобязанность без буквы в номере
+                        if duti_pr:
+                            # Номер обязанности, номер подобязанности, номер текста обязанности, шапка обязанности,
+                            # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                            duti_ppr = [duti_r[0], duti_pr[1], count_ppr, duti_r[1], duti_pr[2],
+                                        match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                        # Если подобязанность с буквой в номере
+                        elif duti_prl:
+                            # Номер обязанности, буква из документа, номер текста обязанности, шапка обязанности,
+                            # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                            duti_ppr = [duti_r[0], duti_prl[1], count_ppr, duti_r[1], duti_prl[2],
+                                        match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                        # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                        Duties_r.append([duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3], duti_ppr[4],
+                                         duti_ppr[5], duti_ppr[6], duti_ppr[7], count_append])
+                    elif count_deep == 2:
+                        count_ur += 1
+                        # Номер обязанности, номер текста обязанности, шапка обязанности, текст обязанности,
+                        # номер распознанного паттерна, уровень обязанности
+                        duti_ppr = [duti_r[0], count_ur, duti_r[1], match["Duti_ppr"][1:-1], count_pattern, count_deep]
+                        # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                        Duties_r.append([duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3],
+                                         duti_ppr[4], duti_ppr[5], count_append])
+                    count_ppr += 1
+                # Если текст обязанности с буквой в номере
+                if match["Duti_pprl"]:
+                    count_deep = 2
+                    # Номер обязанности, буква из документа, шапка обязанности, текст обязанности,
+                    # номер распознанного паттерна, уровень обязанности
+                    duti_pprl = [duti_r[0], match['Duti_ppr_letter'], duti_r[1],
+                                 match["Duti_pprl"][3:-1], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append([duti_pprl[0], duti_pprl[1], duti_pprl[2], duti_pprl[3],
+                                     duti_pprl[4], duti_pprl[5], count_append])
+            # Если последний распознанный паттерн - текст обязанности c буквой в номере
+            elif duti_pprl and duti_pprl[-2] == count_pattern:
+                count_pattern += 1
+                if match["Duti_pprl"]:
+                    if duti_pr:
+                        count_deep = duti_pr[-1] + 1
+                    else:
+                        count_deep = 2
+                    if count_deep == 3:
+                        # Номер обязанности, номер подобязанности, буква из документа, шапка обязанности,
+                        # текст подобязанности, текст обязанности, номер распознанного паттерна, уровень обязанности
+                        duti_pprl = [duti_r[0], duti_pr[1], match['Duti_ppr_letter'], duti_r[1],
+                                     duti_pr[2], match["Duti_pprl"][3:], count_pattern, count_deep]
+                        # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                        Duties_r.append([duti_pprl[0], duti_pprl[1], duti_pprl[2], duti_pprl[3],
+                                         duti_pprl[4], duti_pprl[5], duti_pprl[6], duti_pprl[7], count_append])
+                    elif count_deep == 2:
+                        # Номер обязанности, буква из документа, шапка обязанности, текст обязанности,
+                        # номер распознанного паттерна, уровень обязанности
+                        duti_pprl = [duti_r[0], match['Duti_ppr_letter'], duti_r[1],
+                                     match["Duti_pprl"][3:], count_pattern, count_deep]
+                        # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                        Duties_r.append([duti_pprl[0], duti_pprl[1], duti_pprl[2], duti_pprl[3],
+                                         duti_pprl[4], duti_pprl[5], count_append])
+                elif match["Duti_ppr"]:
+                    count_deep = 2
+                    count_ur += 1
+                    # Номер обязанности, буква из документа, шапка обязанности, текст обязанности,
+                    # номер распознанного паттерна, уровень обязанности
+                    duti_ppr = [duti_r[0], count_ur, duti_r[1],
+                                match["Duti_ppr"][3:], count_pattern, count_deep]
+                    # Добавление обработанной обязанности со всеми параметрами в список "Duties_r"
+                    Duties_r.append([duti_ppr[0], duti_ppr[1], duti_ppr[2], duti_ppr[3],
+                                     duti_ppr[4], duti_ppr[5], count_append])
+    return Duties_r
+
+
+# Дополнение нумерации обязанностей в разделе руководство
+def responsibilities_managment(text_from_key_resp_meneg: str):
+    info_analayser_o_fields = open('info_analayser_responsibilities_managment.log', 'w')
+    info_analayser_o_fields.write(f'<responsibilities_managment>\n\ntext_from_key_resp_meneg - '
+                                  f'{text_from_key_resp_meneg}\n')
+    # Поиск пунктов с перечислением обязанностей
+    responsibility = re.search(r'Текст из документов', text_from_key_resp_meneg)
+    # Итоговый список обязанностей
+    Duties_r_m = []
+    # Счетчик номера обязанности
+    count_r_m = 1
+    # Счётчик выявления паттернов
+    count_pattern = 0
+    info_analayser_o_fields.write(f'responsibility - {responsibility}\n')
+    info_analayser_o_fields.close()
+    for match in re.finditer(r'(?P<Duti_r_ml>'
+                             r'(?P<Duti_r_ml_number>[а-я]+(\.[0-9]+)?)\)\s?(?P<Duti_r_ml_not_number>.+[:;.]))|'
+                             r'(?P<Duti_r_m>-.+[:;.])|'
+                             r'(?P<Duti_other>.+осуществляет также другие.+)', responsibility[0]):
+        if match["Duti_r_ml"]:
+            count_pattern += 1
+            # Буква из документа, текст обязанности, номер выявленного паттерна
+            Duties_r_m.append([match["Duti_r_ml_number"], match["Duti_r_ml_not_number"][:-1], count_pattern])
+        elif match["Duti_r_m"]:
+            count_pattern += 1
+            # Номер обязанности, текст обязанности, номер выявленного паттерна
+            Duties_r_m.append([count_r_m, match["Duti_r_m"][1:-1], count_pattern])
+            count_r_m += 1
+    return Duties_r_m
+
+
+# Дополнение нумерации полномочий
+def authorities(text_from_key_a: str):
+    # Итоговый список полномочий
+    Duties_a = []
+    # Счетчик номера выявленного текста полномочия
+    count_ppa = 1
+    # Счётчик выявления паттернов
+    count_pattern = 0
+    # Создание списков для хранения результатов последнего распознавания по шаблону
+    # Список с полномочием
+    duti_a = []
+    # Список с заголовком полномочия с пунктами
+    duti_pa = []
+    # Список с пунктом полномочия
+    duti_ppa = []
+    for match in re.finditer(r'(?P<Duti_other>.+осуществляет иные.+)|'
+                             r'(?P<Duti_a>(?P<Duti_a_number>[0-9]+(\.[0-9]+)?)\)\s(?P<Duti_a_not_number>.+[;.]))|'
+                             r'(?P<Duti_pa>(?P<Duti_pa_number>[0-9]+(\.[0-9]+)?)\)\s(?P<Duti_pa_not_number>.+:))|'
+                             r'(?P<Duti_ppa>-?.+[;.])', text_from_key_a):
+        # Поиск полномочий
+        if match["Duti_a"]:
+            count_pattern += 1
+            # Номер полномочия, текст полномочия
+            duti_a = [match["Duti_a_number"], match["Duti_a_not_number"], count_pattern]
+            Duties_a.append([duti_a[0], duti_a[1], duti_a[2]])
+            count_ppa = 1
+        # Поиск подполномочий
+        elif match["Duti_pa"]:
+            # Номер подполномочия, текст подполномочия
+            duti_pa = [match["Duti_pa_number"], match["Duti_pa_not_number"]]
+            count_ppa = 1
+        # Поиск текста подполномочий
+        elif match["Duti_ppa"]:
+            count_pattern += 1
+            # Номер полномочия, номер подполномочия, текст под полномочия, текст полномочия
+            duti_ppa = [duti_pa[0], count_ppa, duti_pa[1][:-1], match["Duti_ppa"][1:], count_pattern]
+            Duties_a.append([duti_ppa[0], duti_ppa[1], duti_ppa[2], duti_ppa[3], duti_ppa[4]])
+            count_ppa += 1
+    return Duties_a
+
+
+# Дополнение нумерации задач
+def tasks(text_from_key_z: str):
+    # Итоговый список задач
+    Duties_z = []
+    # Счётчик номера задачи
+    count_z = 1
+    # Счётчик выявления паттернов
+    count_pattern = 0
+    for match in re.finditer(r'(?P<Duti_z_other>.+другие задачи.+)|'
+                             r'(?P<Duti_z>(?P<Duti_z_number>[0-9а-я]{1,3})\)\s?(?P<Duti_z_not_number>.+[;.]))|'
+                             r'(?P<Duti_zn>(?P<Duti_zn_not_number>.+[;.]))', text_from_key_z):
+        count_pattern += 1
+        if match["Duti_zn"]:
+            Duties_z.append([count_z, match["Duti_zn_not_number"][1:-1], count_pattern])
+            count_z += 1
+        elif match["Duti_z"]:
+            Duties_z.append([match["Duti_z_number"], match["Duti_z_not_number"][:-1], count_pattern])
+            count_z += 1
+    return Duties_z
+
+
+# Дополнение нумерации функций
+def functions(text_from_key_f: str):
+    # Итоговый список функций
+    Duties_f = []
+    # Счетчик номера функции
+    count_f = 1
+    # Подсчёт добавления функции в "Duties_f", кроме одной и той же подфункции
+    count_uf = 1
+    # Счетчик номера подфункции
+    count_pf = 0
+    # Счетчик номера выявленного текста функции
+    count_ppf = 1
+    # Счетчик уровня функции
+    count_deep = 1
+    # Счётчик выявления паттернов
+    count_pattern = 0
+    # Счётчик добавления в Duties_f
+    count_append = 0
+    # Создание списков для хранения результатов последнего распознавания по шаблону
+    # Список с шапкой функции
+    duti_f = []
+    # Список с подфункцией без буквы в нумерации
+    duti_pf = []
+    # Список с подфункцией с буквой в нумерации
+    duti_pfl = []
+    # Список с текстом функции без буквы в нумерации
+    duti_ppf = []
+    # Список с текстом функции с буквой в нумерации
+    duti_ppfl = []
+    # Частный случай для некоторого документа
+    if 'Текст встречающийся только в некотором документе' in text_from_key_f:
+        for match in re.finditer(r'(?P<Duti_f_other>.+осуществляет иные.+)|'
+                                 r'(?P<Duti_f>(?P<Duti_f_letter>[а-я]+)\)\s?(?P<Duti_f_not_letter>.+;))',
+                                 text_from_key_f):
+            if match["Duti_f"]:
+                count_pattern += 1
+                # Буква функции, текст функции, номер выявленного паттерна
+                duti_f = [match["Duti_f_letter"], match["Duti_f_not_letter"][:-1], count_pattern]
+                Duties_f.append([duti_f[0], duti_f[1], duti_f[2]])
+    else:
+        for match in re.finditer(r'(?P<Duti_f_other>.+(осуществляет иные функции|также осуществляет иные).+)|'
+                                 r'(?P<Duti_f>(?P<Duti_f_number>[0-9]+)\)\s?(?P<Duti_f_not_number>.+:))|'
+                                 r'(?P<Duti_pfl>(?P<Duti_pf_letter>[а-я])\).+:)+|'
+                                 r'(?P<Duti_pf>-?.+:)+|'
+                                 r'(?P<Duti_ppfl>(?P<Duti_ppf_letter>[а-я])\).+[;.])+|'
+                                 r'(?P<Duti_ppf>-?((?P<Duti_ppf_number>[0-9]+)\))?(?P<Duti_ppf_not_number>.+[;.]))+',
+                                 text_from_key_f):
+            # Поиск функций
+            if match["Duti_f"]:
+                # Обнуляется уровень функции
+                count_pattern += 1
+                count_deep = 1
+                # Номер функции, текст функции, номер выявленного паттерна, уровень функции
+                duti_f = [match["Duti_f_number"], match["Duti_f_not_number"][:-1], count_pattern, count_deep]
+                count_f += 1
+                count_uf = 1
+                count_pf = 0
+                count_ppf = 1
+            # Поиск подфункций
+            elif match["Duti_pf"] or match["Duti_pfl"]:
+                # Если номер подфункции с буквой
+                if match["Duti_pfl"]:
+                    # Если последняя добавленная в Duties_f функция с буквой
+                    if duti_ppfl and duti_ppfl[-2] == count_pattern:
+                        # Счетчик уровня функции приравнивается к
+                        # счетчику уровня последней добавленной в Duties_f функции
+                        count_deep = Duties_f[-1][-2]
+                        count_pattern += 1
+                        if count_deep == 3:
+                            # Номер функции, номер подфункции, буква из документа, текст подфункции1,
+                            # текст подфункции2, номер выявленного паттерна, уровень подфункции
+                            duti_pfl = [count_f - 1, count_pf, match["Duti_pf_letter"], duti_pf[2],
+                                        match["Duti_pfl"][3:-1], count_pattern, count_deep]
+                        elif count_deep == 2:
+                            # Номер функции, буква из документа, текст подфункции,
+                            # номер выявленного паттерна, уровень подфункции
+                            duti_pfl = [count_f - 1, match["Duti_pf_letter"], match["Duti_pfl"][3:-1], count_pattern,
+                                        count_deep]
+                    # В остальных случаях
+                    else:
+                        # Уровень увеличивается на 1
+                        count_deep = duti_f[-1] + 1
+                        count_pattern += 1
+                        # Номер функции, буква из документа, текст подфункции,
+                        # номер выявленного паттерна, уровень подфункции
+                        duti_pfl = [count_f - 1, match["Duti_pf_letter"], match["Duti_pfl"][3:-1],
+                                    count_pattern, count_deep]
+                # Если номер подфункции без буквы
+                else:
+                    # Если уже была подфункция с буквой (т.е. обрабатывается случай типа "Функция 1 пункт а пункт а")
+                    if duti_pfl and duti_pfl[-1] == 2:
+                        # Если последний был текст функции без буквы
+                        if duti_ppf and duti_ppf[-2] == count_pattern:
+                            count_uf = count_ppf
+                        else:
+                            count_uf += 1
+                        count_pattern += 1
+                        count_deep = 3
+                        # Номер функции, буква подфункции, номер подфункции, текст подфункции, текст подфункции,
+                        # номер распознанного паттерна, уровень подфункции
+                        duti_pf = [count_f - 1, duti_pfl[1], count_uf, duti_pfl[2], match["Duti_pf"][1:-1],
+                                   count_pattern, count_deep]
+                    else:
+                        count_pattern += 1
+                        count_deep = 2
+                        # Номер функции, номер подфункции, текст подфункции,
+                        # номер распознанного паттерна, уровень подфункции
+                        duti_pf = [count_f - 1, count_uf, match["Duti_pf"][1:-1], count_pattern, count_deep]
+                        count_uf += 1
+                count_pf += 1
+                count_ppf = 1
+            # Поиск текста функций
+            elif match["Duti_ppf"] or match["Duti_ppfl"]:
+                # Если была распознана функция с пунктами
+                if duti_f:
+                    count_append += 1
+                    # Если последний распознанный паттерн - функция
+                    if duti_f and duti_f[-2] == count_pattern:
+                        count_deep = 2
+                        count_pattern += 1
+                        # Если распознан текст функции без буквы в номере
+                        if match["Duti_ppf"]:
+                            # Номер функции, номер текста функции, функция, текст функции,
+                            # номер распознанного паттерна, уровень функции
+                            duti_ppf = [count_f - 1, count_uf, duti_f[1], match["Duti_ppf"][1:],
+                                        count_pattern, count_deep]
+                            # Добавление в список функций списка с параметрами отдельной функции
+                            Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                             duti_ppf[4], duti_ppf[5], count_append])
+                            count_uf += 1
+                        # Если распознан текст функции с буквой в номере
+                        elif match["Duti_ppfl"]:
+                            # Номер функции, буква из документа, функция, текст функции,
+                            # номер распознанного паттерна, уровень функции
+                            duti_ppfl = [count_f - 1, match['Duti_ppf_letter'], duti_f[1], match["Duti_ppfl"][3:],
+                                         count_pattern, count_deep]
+                            # Добавление в список функций списка с параметрами отдельной функции
+                            Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3], duti_ppfl[4],
+                                             duti_ppfl[5], count_append])
+                    # Если последний распознанный паттерн - подфункция без буквы в номере
+                    elif duti_pf and duti_pf[-2] == count_pattern:
+                        count_deep = duti_pf[-1] + 1
+                        count_pattern += 1
+                        if count_deep == 4:
+                            # Если распознан текст функции без буквы в номере
+                            if match["Duti_ppf"]:
+                                # Номер функции, буква подфункции, номер подфункции, номер текста функции, функция,
+                                # подфункция, подфункция, текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppf = [count_f - 1, duti_pfl[1], count_uf, count_ppf, duti_f[1], duti_pfl[2],
+                                            duti_pf[4], match["Duti_ppf"][1:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], duti_ppf[4],
+                                                 duti_ppf[5], duti_ppf[6], duti_ppf[7], duti_ppf[8], duti_ppf[9],
+                                                 count_append])
+                                count_ppf += 1
+                        elif count_deep == 3:
+                            # Если распознан текст функции без буквы в номере
+                            if match["Duti_ppf"]:
+                                # Номер функции, номер подфункции, номер текста функции, функция, подфункция,
+                                # текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppf = [count_f - 1, count_uf - 1, count_ppf, duti_f[1], duti_pf[2],
+                                            match["Duti_ppf"][1:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], duti_ppf[4],
+                                                 duti_ppf[5], duti_ppf[6], duti_ppf[7], count_append])
+                                count_ppf += 1
+                            # Если распознан текст функции с буквой в номере
+                            elif match["Duti_ppfl"]:
+                                # Номер функции, номер подфункции, буква из документа, функция, подфункция,
+                                # текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppfl = [count_f - 1, count_uf - 1, match['Duti_ppf_letter'], duti_f[1],
+                                             duti_pf[2], match["Duti_ppfl"][3:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3],
+                                                 duti_ppfl[4], duti_ppfl[5], duti_ppfl[6], duti_ppfl[7], count_append])
+                    # Если последний распознанный паттерн - подфункция с буквой в номере
+                    elif duti_pfl and duti_pfl[-2] == count_pattern:
+                        count_deep = duti_pfl[-1] + 1
+                        count_pattern += 1
+                        # Если распознан текст функции без буквы в номере
+                        if match["Duti_ppf"]:
+                            if count_deep == 4:
+                                # Номер функции, номер подфункции, буква из документа, номер текста функции, функция,
+                                # подфункция, подфункция, текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppf = [count_f - 1, duti_pf[1], duti_pfl[2], count_ppf, duti_f[1], duti_pf[2],
+                                            duti_pfl[3], match["Duti_ppf"][1:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], duti_ppf[4],
+                                                 duti_ppf[5], duti_ppf[6], duti_ppf[7], duti_ppf[8], duti_ppf[9],
+                                                 count_append])
+                                count_ppf += 1
+                            elif count_deep == 3:
+                                # Номер функции, буква из документа, номер текста функции, функция, подфункция,
+                                # текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppf = [count_f - 1, duti_pfl[1], count_ppf, duti_f[1], duti_pfl[2],
+                                            match["Duti_ppf"][1:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], duti_ppf[4],
+                                                 duti_ppf[5], duti_ppf[6], duti_ppf[7], count_append])
+                                count_ppf += 1
+                    # Если последний распознанный паттерн - текст функции без буквы в номере
+                    elif duti_ppf and duti_ppf[-2] == count_pattern:
+                        count_pattern += 1
+                        # Если распознан текст функции без буквы в номере
+                        if match["Duti_ppf"]:
+                            # Если у текста функции уже есть номер
+                            if match["Duti_ppf_number"]:
+                                count_deep = 1
+                                count_f += 1
+                                # Номер функции, текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppf = [match["Duti_ppf_number"], match["Duti_ppf_not_number"][1:-1],
+                                            count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], count_append])
+                            # Если у текста функции нет номера
+                            else:
+                                count_deep = duti_ppf[-1]
+                                if count_deep == 4:
+                                    # Если была распознана подфункция с буквой в номере на втором уровне вложенности
+                                    if duti_pfl and duti_pfl[-1] == 2:
+                                        # Номер функции, буква из документа, номер подфункции,
+                                        # номер текста функции, функция, подфункция1, подфункция2,
+                                        # текст функции, номер распознанного паттерна, уровень функции
+                                        duti_ppf = [count_f - 1, duti_pfl[1], duti_pf[2], count_ppf, duti_f[1],
+                                                    duti_pfl[2], duti_pf[4], match["Duti_ppf"][1:],
+                                                    count_pattern, count_deep]
+                                        # Добавление в список функций списка с параметрами отдельной функции
+                                        Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                                         duti_ppf[4], duti_ppf[5], duti_ppf[6], duti_ppf[7],
+                                                         duti_ppf[8], duti_ppf[9], count_append])
+                                    else:
+                                        # Номер функции, номер подфункции, буква из документа,
+                                        # номер текста функции, функция, подфункция1, подфункция2,
+                                        # текст функции, номер распознанного паттерна, уровень функции
+                                        duti_ppf = [count_f - 1, duti_pf[1], duti_pfl[2], count_ppf, duti_f[1],
+                                                    duti_pf[2], duti_pfl[3], match["Duti_ppf"][1:],
+                                                    count_pattern, count_deep]
+                                        # Добавление в список функций списка с параметрами отдельной функции
+                                        Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                                         duti_ppf[4], duti_ppf[5], duti_ppf[6], duti_ppf[7],
+                                                         duti_ppf[8], duti_ppf[9], count_append])
+                                elif count_deep == 3:
+                                    # Если была распознана подфункция с буквой в номере
+                                    if duti_pfl:
+                                        # Номер функции, номер подфункции, номер текста функции, функция,
+                                        # подфункция, текст функции, номер распознанного паттерна, уровень функции
+                                        duti_ppf = [count_f - 1, duti_pfl[1], count_ppf, duti_f[1], duti_pfl[2],
+                                                    match["Duti_ppf"][1:], count_pattern, count_deep]
+                                    # Если была распознана подфункция без буквы в номере
+                                    elif duti_pf:
+                                        # Номер функции, номер подфункции, номер текста функции, функция, подфункция,
+                                        # текст функции, номер распознанного паттерна, уровень функции
+                                        duti_ppf = [count_f - 1, count_uf - 1, count_ppf, duti_f[1], duti_pf[2],
+                                                    match["Duti_ppf"][1:], count_pattern, count_deep]
+                                    # Добавление в список функций списка с параметрами отдельной функции
+                                    Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                                     duti_ppf[4], duti_ppf[5], duti_ppf[6], duti_ppf[7], count_append])
+                                elif count_deep == 2:
+                                    # Номер функции, номер текста функции, функция, текст функции,
+                                    # номер распознанного паттерна, уровень функции
+                                    duti_ppf = [count_f - 1, count_uf, duti_f[1], match["Duti_ppf"][1:],
+                                                count_pattern, count_deep]
+                                    # Добавление в список функций списка с параметрами отдельной функции
+                                    Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                                     duti_ppf[4], duti_ppf[5], count_append])
+                                    count_uf += 1
+                            count_ppf += 1
+                        # Если распознан текст функции с буквой в номере
+                        elif match["Duti_ppfl"]:
+                            # Если была распознана подфункция с буквой в номере
+                            if duti_pfl:
+                                count_deep = duti_pfl[-1]
+                            # Если была распознана подфункция без буквы в номере
+                            elif duti_pf:
+                                count_deep = duti_pf[-1]
+                            if count_deep == 3:
+                                # Номер функции, номер подфункции, буква из документа, функция,
+                                # подфункция, текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppfl = [count_f - 1, count_uf - 1, match['Duti_ppf_letter'], duti_f[1],
+                                             duti_pf[2], match["Duti_ppfl"][3:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3],
+                                                 duti_ppfl[4], duti_ppfl[5], duti_ppfl[6], duti_ppfl[7], count_append])
+                            elif count_deep == 2:
+                                # Номер функции, буква из документа, функция, текст функции,
+                                # номер распознанного паттерна, уровень функции
+                                duti_ppfl = [count_f - 1, match['Duti_ppf_letter'], duti_f[1], match["Duti_ppfl"][3:],
+                                             count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3],
+                                                 duti_ppfl[4], duti_ppfl[5], count_append])
+                    # Если последний распознанный паттерн - текст функции с буквой в номере
+                    elif duti_ppfl and duti_ppfl[-2] == count_pattern:
+                        count_pattern += 1
+                        # Если распознан текст функции без буквы в номере
+                        if match["Duti_ppf"]:
+                            # Если была распознана подфункция без буквы в номере
+                            if duti_pf:
+                                count_deep = duti_pf[-1]
+                            # Если была распознана подфункция с буквой в номере
+                            elif duti_pfl:
+                                count_deep = duti_pfl[-1] - 1
+                            # Номер функции, номер текста функции, функция, текст функции,
+                            # номер распознанного паттерна, уровень функции
+                            duti_ppf = [count_f - 1, count_uf, duti_f[1], match["Duti_ppf"][1:],
+                                        count_pattern, count_deep]
+                            # Добавление в список функций списка с параметрами отдельной функции
+                            Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3],
+                                             duti_ppf[4], duti_ppf[5], count_append])
+                            count_uf += 1
+                        # Если распознан текст функции с буквой в номере
+                        elif match["Duti_ppfl"]:
+                            count_deep = duti_ppfl[-1]
+                            if count_deep == 3:
+                                # Номер функции, номер подфункции, буква из документа, функция,
+                                # подфункция, текст функции, номер распознанного паттерна, уровень функции
+                                duti_ppfl = [count_f - 1, count_uf - 1, match['Duti_ppf_letter'], duti_f[1],
+                                             duti_pf[2], match["Duti_ppfl"][3:], count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3],
+                                                 duti_ppfl[4], duti_ppfl[5], duti_ppfl[6], duti_ppfl[7], count_append])
+                            elif count_deep == 2:
+                                # Номер функции, буква из документа, функция, текст функции,
+                                # номер распознанного паттерна, уровень функции
+                                duti_ppfl = [count_f - 1, match['Duti_ppf_letter'], duti_f[1], match["Duti_ppfl"][3:],
+                                             count_pattern, count_deep]
+                                # Добавление в список функций списка с параметрами отдельной функции
+                                Duties_f.append([duti_ppfl[0], duti_ppfl[1], duti_ppfl[2], duti_ppfl[3],
+                                                 duti_ppfl[4], duti_ppfl[5], count_append])
+                # Если была распознана функция без пунктов
+                else:
+                    count_pattern += 1
+                    count_deep = 1
+                    count_append += 1
+                    count_f += 1
+                    count_uf = 1
+                    count_pf = 0
+                    count_ppf = 1
+                    # Если распознан текст функции без буквы в номере
+                    if match["Duti_ppf"]:
+                        # Номер функции, функция, номер распознанного паттерна, уровень функции
+                        duti_ppf = [count_f - 1, match["Duti_ppf_not_number"][1:], count_pattern, count_deep]
+                        # Добавление в список функций списка с параметрами отдельной функции
+                        Duties_f.append([duti_ppf[0], duti_ppf[1], duti_ppf[2], duti_ppf[3], count_append])
+    return Duties_f
+
+
+# Функция перевода даты из текстового формата (который используется в НПА) в формат datetime
+def text_to_date(from_date: datetime):
+    day = re.search(r'\d{1,2}\s?', from_date)[0]
+    month = re.search(r'\w{3,8}', from_date)[0].lower()
+    year = re.search(r'\d\s?\d\s?\d\s?\d\s?', from_date)[0].replace(" ", "")
+
+    months = {'января': '01', 'февраля': '02', 'марта': '03', 'апреля': '04',
+              'мая': '05', 'июня': '06', 'июля': '07', 'августа': '08',
+              'сентября': '09', 'октября': '10', 'ноября': '11', 'декабря': '12'}
+    month = months[month]
+
+    return datetime.strptime(f"{year}/{month}/{day}".strip(), '%Y/%m/%d')
+
+
+# ________________________________________4.Основная функция, обрабатывающая документ___________________________________
+
+
+def read_pdf(file_name: str):
+
+    # ___________________________4.1 Считывание текста из документа____________________________
+
+    path = 'Путь к файлу из переменной file_name'
+    text = ''
+    # Открытие загружаемого файла и считывание текста постранично
+    file = fitz.open(path)
+    # Сохранение распознанного текста в переменную "text"
+    for pageNum, page in enumerate(file.pages()):
+        text += page.get_text()
+    result = text.replace('\n', ' ')
+
+    # ___________________________4.2 Обработка текста и частных случаев____________________________
+
+    # Удаление номеров страниц
+    result = re.sub(r'((?<![«№N-]) +[0-9]{1,2} +(?!янв|фев|мар|апр|мая|июн|июл|авг|сент|окт|ноя|дек|прил|(к )|»|))',
+                    ' ', result)
+    # Удаление лишних пробелов
+    result = re.sub(r' {2,}', ' ', result)
+    result = re.sub(r'(?<=[а-яА-Я]) (?=;)', '', result)
+    result = re.sub(r'(?<=[а-я]) (?=\))', '', result)
+    # Удаление нижних подчеркиваний
+    result = re.sub(r'_+', '', result)
+    # Удаление текста в скобках о редакциях, пунктах и т.д.
+    result = re.sub(r'(\((п\. )?в ред\. [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(п\. [0-9]*\.?[0-9]* [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(пп\. [0-9]*\.?[0-9]* [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(пп\. "[а-я]" в ред\. [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(пп\. в ред\. [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(пп\. "[а-я](\.1)?" введен [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(см\. текст [а-яА-Я0-9.,;№N ]+\) |'
+                    r'\(абзац введен [а-яА-Я0-9.,;№N ]+\) )', r'', result)
+    # Удаление пробела после дефиса
+    result = re.sub(r'(\w-) ', r'\1', result)
+    # Удаление мусорных фраз и символов
+    result = re.sub(r'НОРМАТИВНЫЙ ', r'', result)
+    result = re.sub(r'Список изменяющих документов ', r'', result)
+
+    """
+    Здесь обрабатывать частные случаи
+    """
+
+    # Добавление символа новой строки в начале нового раздела
+    result = re.sub(r' (I+V*\.) ', r'\n\1', result)
+
+    # ___________________________4.3 Разделение на блоки____________________________
+
+    # Создание списка по разделам текста
+    list_results = result.split('\n')
+    # Открытие файла, в котором сохраняются разделы текста
+    info_analayser_text_moduls = open('info_analayser_text_moduls.log', 'w')
+
+    # Сохранение в словарь по разделам (I, II, III...)
+    for id, list_result in enumerate(list_results):
+        # Первый раздел всегда "Первый лист"
+        if id == 0:
+            moduls_doc['Первый лист'] = list_result
+            # Сохранение раздела "Первый лист" в файл
+            info_analayser_text_moduls.write(f'<text_moduls>\n\nmoduls_doc["Первый лист"] - '
+                                             f'{moduls_doc["Первый лист"]}\n\n')
+        # Второй раздел всегда "Титульная информация"
+        elif id == 1:
+            moduls_doc['Титульная информация'] = list_result
+            # Сохранение раздела "Титульная информация" в файл
+            info_analayser_text_moduls.write(f'moduls_doc["Титульная информация"] - '
+                                             f'{moduls_doc["Титульная информация"]}\n\n')
+        # Поиск совпадения и сохранения по ключу "Общие положения"
+        elif re.search(r'Текст из документов, в которых нужно искать фрагменты в Общих положениях', list_result):
+            moduls_doc['Общие положения'] = list_result
+            # Сохранение раздела "Общие положения" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Общие положения'] - {moduls_doc['Общие положения']}\n\n")
+        # Поиск совпадения и сохранения по ключу "Полномочия"
+        elif re.search(r'II\.\s?Полномочия', list_result):
+            moduls_doc['Полномочия'] = list_result
+            # Сохранение раздела "Полномочия" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Полномочия'] - {moduls_doc['Полномочия']}\n\n")
+        # Поиск совпадения и сохранения по ключу "Задачи"
+        elif re.search(r'(II|6)\.\s?Основн(ые|ыми) задач(и|ами)', list_result):
+            moduls_doc['Задачи'] = list_result
+            # Сохранение раздела "Задачи" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Задачи'] - {moduls_doc['Задачи']}\n\n")
+        # Поиск совпадения и сохранения по ключу "Функции"
+        elif re.search(
+                r'III\.\s?([Оо]сновные\s)?[Фф]ункции', list_result):
+            moduls_doc['Функции'] = list_result
+            # Сохранение раздела "Функции" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Функции'] - {moduls_doc['Функции']}\n\n")
+        # Поиск совпадения и сохранения по ключу "Обязанности"
+        elif re.search(r'Текст из документов, в которвх нужно искать обязанности', list_result):
+            moduls_doc['Обязанности'] = list_result
+            # Сохранение раздела "Обязанности" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Обязанности'] - {moduls_doc['Обязанности']}\n\n")
+        # Поиск совпадения и сохранения по ключу "Руководство"
+        elif re.search(r'IV\.\s?Руководство', list_result):
+            moduls_doc['Руководство'] = list_result
+            # Сохранение раздела "Руководство" в файл
+            info_analayser_text_moduls.write(f"moduls_doc['Руководство'] - {moduls_doc['Руководство']}\n\n")
+    # Закрытие файла с разделами распознанного текста
+    info_analayser_text_moduls.close()
+
+    # Добавление символа новой строки в разделах
+    for key in moduls_doc:
+        moduls_doc[key] = re.sub(
+            r'(?<=[а-яА-Я.,:;)]) (?=([0-9]{1,2}[.)])([0-9]{1,2}\))?)', r'\n', moduls_doc[key])
+        # Добавление символа новой строки после ":", ";"
+        moduls_doc[key] = re.sub(r'(?<=[:;]) ((?=[а-я]\)))', r'\n', moduls_doc[key])
+        # Добавление символа новой строки после точки
+        moduls_doc[key] = re.sub(r'([а-я]{2,}\)?»?\.)( )(?=[А-Я].*\.)', r'\1\n', moduls_doc[key])
+
+    # ___________________________4.4 Выявление основных параметров документа____________________________
+
+    # Определение параметров документа (название, номер, дата, актуальность, уровень, тип и
+    # переменная для сравнения названия с базой данных
+    global fname, fnumber, fdate, factual, flevel, fdtype, doc_type_duty
+
+    # Поиск названия документа
+    fname = re.search(r'Фрагменты текста, где может находиться название документа',
+                      moduls_doc['Первый лист'])
+
+    # Перевод первого слова в fname гарантированно в заглавную форму
+    first_word_title = fname.split(' ')[0].title()
+    next_word_title = fname.split(' ')[1:]
+    next_word_title = ' '.join(next_word_title)
+    fname = f'{first_word_title} {next_word_title}'
+
+    # Поиск номер документа
+    number = re.search(r'([№N]\s[0-9]{1,4}\s?)',
+                       moduls_doc["Титульная информация"])
+    # Корректировка записи номера при некорректном распознавании символов PDF документа
+    if number:
+        fnumber = re.sub(r'N', r'№', number[0])
+
+    # Поиск даты издания документа
+    if re.search(r'(\s+«\s*)?\d{1,2}\s+\w{3,8}\s+(\d\s?){4}\s?г\.|\d{1,2}\.\d{1,2}\.\d{4}',
+                 moduls_doc["Титульная информация"]):
+        dates = re.search(r'(\s+«\s*)?\d{1,2}\s+\w{3,8}\s+(\d\s?){4}\s?г\.|\d{1,2}\.\d{1,2}\.\d{4}',
+                          moduls_doc["Титульная информация"])
+    else:
+        dates = re.search(r'((?<=№ [0-9][0-9][0-9] )|(?<=№ [0-9][0-9] )|'
+                          r'(?<=№ [0-9] )\.? ?)((\s+«\s*)?\d{1,2}\s+\w{3,8}\s+(\d\s?){4}\s?г\.)',
+                          moduls_doc["Первый лист"])
+    fdate = text_to_date(dates[0])
+
+    # Определение актуальности документа
+    if dates and fdate > datetime.now():
+        factual = "Проект"
+    else:
+        factual = "Действует"
+
+    # Определение уровня документа
+    level = re.search(r'(?i)текст1|текст2|текст3|текст4|текст5|текст6', moduls_doc['Первый лист'])
+
+    # Определение лица издавшего документ и присвоение номера согласно базе данных
+    if level:
+        level_low = level[0].lower()
+        if 'текст1' in level_low:
+            flevel = 1
+        elif 'текст2' in level_low:
+            flevel = 2
+        elif 'текст4' in level_low:
+            flevel = 4
+        elif 'текст3.1' in level_low and 'текст3.2' in level_low:
+            flevel = 3
+        elif 'текст5.1' in level_low and 'текст5.2' in level_low and 'текст5.3' in level_low:
+            flevel = 5
+        elif 'текст6' in level_low and 'текст6' in level_low:
+            flevel = 6
+        else:
+            flevel = 3
+    else:
+        flevel = 3
+
+    # Определение типа документа
+    dtype = re.search(r'(?i)текст1|текст2|текст3|'
+                      r'текст4|текст5|текст6|текст7|текст8|текст9', moduls_doc["Титульная информация"])
+
+    # Сохранение вида документа для правильного определения типа при добавлении документа в комплекс
+    doc_type_duty = dtype[0].lower()
+
+    # Определение типа документа и присвоение номера согласно базе данных
+    if dtype:
+        dtype_low = dtype[0].lower()
+        if 'текст1.1' in dtype_low and 'текст1.2' in dtype_low and 'текст.3' in dtype_low:
+            fdtype = 1
+        elif 'текст2.1' in dtype_low and 'текст2.2' in dtype_low:
+            fdtype = 2
+        elif 'текст3' in dtype_low:
+            fdtype = 3
+        elif 'текст7' in dtype_low:
+            fdtype = 7
+        elif 'текст4' in dtype_low:
+            fdtype = 4
+        elif 'текст5' in dtype_low:
+            fdtype = 5
+        elif 'текст6' in dtype_low:
+            fdtype = 6
+        elif 'текст8' in dtype_low:
+            fdtype = 8
+        elif 'текст9' in dtype_low:
+            fdtype = 9
+        else:
+            fdtype = 6
+    else:
+        fdtype = 6
+
+    # Переменная для сравнения названия из документа с названием из базы данных
+    document_o_name = fname
+
+    # Открытие и закрытие файла, в котором сохраняются параметры документа
+    info_analayser_doc_parameters = open('info_analayser_doc_parameters.log', 'w')
+    info_analayser_doc_parameters.write(f'<doc_parameters>\n\nfname - {fname}\n')
+    info_analayser_doc_parameters.write(f'fnumber - {fnumber}\n')
+    info_analayser_doc_parameters.write(f'fdate - {fdate}\n')
+    info_analayser_doc_parameters.write(f'factual - {factual}\n')
+    info_analayser_doc_parameters.write(f'level - {level}\n')
+    info_analayser_doc_parameters.write(f'flavel - {flevel}\n')
+    info_analayser_doc_parameters.write(f'dtype - {dtype}\n')
+    info_analayser_doc_parameters.write(f'fdtype - {fdtype}\n')
+    info_analayser_doc_parameters.write(f'doc_type_duty - {doc_type_duty}\n')
+    info_analayser_doc_parameters.write(f'document_o_name - {document_o_name}\n')
+    info_analayser_doc_parameters.close()
+
+    # Вариант вывода результатов №2 - в консоль.
+    # print(f'fname - {fname}')
+    # print(f'fnumber - {fnumber}')
+    # print(f'fdate - {fdate}')
+    # print(f'factual - {factual}')
+    # print(f'level - {level[0]}')
+    # print(f'flavel - {flevel}')
+    # print(f'dtype - {dtype[0]}')
+    # print(f'fdtype - {fdtype}')
+    # print(f'doc_type_duty - {doc_type_duty}')
+    # print(f'document_o_name - {document_o_name}')
+    # print(f"{Bcolors.OKGREEN}{'-' * 80}{Bcolors.ENDC}")
+
+    # ___________________________4.5 Выделение и вывод абзацев____________________________
+    global duties_counter, array_duties_count, array_duties, document_o_name
+    duties_counter = 0
+    array_duties = []
+    array_duties_count = 0
+
+    # Удаление заглавных (лишних) строк разделов.
+    # В зависимости от структуры раздела убираются одна или две первые строки
+    for key in moduls_doc:
+        if key == 'Полномочия':
+            moduls_doc[key] = moduls_doc[key].split('\n')[2:]
+            moduls_doc[key] = '\n'.join(moduls_doc[key])
+        elif key == 'Обязанности':
+            moduls_doc[key] = moduls_doc[key].split('\n')[1:]
+            moduls_doc[key] = '\n'.join(moduls_doc[key])
+        elif key == 'Задачи':
+            moduls_doc[key] = moduls_doc[key].split('\n')[2:]
+            moduls_doc[key] = '\n'.join(moduls_doc[key])
+        elif key == 'Функции':
+            moduls_doc[key] = moduls_doc[key].split('\n')[2:]
+            moduls_doc[key] = '\n'.join(moduls_doc[key])
+        elif key == 'Общие положения' or key == 'Руководство':
+            moduls_doc[key] = moduls_doc[key].split('\n')[1:]
+            moduls_doc[key] = '\n'.join(moduls_doc[key])
+
+    # Открытие файла, в котором сохраняются отдельные полномочия, обязанности, задачи, функции
+    info_analayser_doc_lines = open('info_analayser_doc_lines.log', 'w')
+    info_analayser_doc_lines.write(f'<doc_lines>\n\n')
+
+    # Вызов функций, выделяющих в отдельный список каждое(ую) полномочие, обязанность, задачу, функцию
+    # с кол-вом элементов, зависящим от уровня вложенности (пояснение непосредственно в функциях)
+    # Добавление в array_duties в виде списка с элементами:
+    # ['задача\функция\и т.д.', номер, текст]
+    for key in moduls_doc:
+        if key == 'Обязанности' and (dut_o_boss_type == 5 or dut_o_boss_type == 9):
+            # Функция, дополняющая нумерацию
+            data_from_resp = responsibilities(moduls_doc[key])
+            for resp in data_from_resp:
+                if len(resp) == 5:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_resp = resp[1][0].upper() + resp[1][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Обязанность", resp[0], f'{text_resp}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'resp - Обязанность {resp[0]} {text_resp}.\n')
+                elif len(resp) == 7:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_resp = resp[2][0].upper() + resp[2][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Обязанность", f'{resp[0]} абзац {resp[1]}', f'{text_resp} {resp[3]}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'resp - Обязанность {resp[0]} абзац {resp[1]}'
+                                                   f' {text_resp} {resp[3]}.\n')
+                elif len(resp) == 9:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_resp = resp[3][0].upper() + resp[3][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Обязанность", f'{resp[0]} абзац {resp[1]} подабзац {resp[2]}',
+                                         f'{text_resp} {resp[4]} {resp[5]}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'resp - Обязанность {resp[0]} абзац {resp[1]} '
+                                                   f'подабзац {resp[2]} {text_resp} {resp[4]} {resp[5]}.\n')
+        elif key == 'Полномочия' and dut_o_boss_type == 3:
+            # Функция, дополняющая нумерацию
+            data_from_auth = authorities(moduls_doc[key])
+            for authority in data_from_auth:
+                if len(authority) == 3:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_authority = authority[1][0].upper() + authority[1][1:-1]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Полномочие", authority[0], f"{text_authority}."])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'authority - Полномочие {authority[0]} {text_authority}.\n')
+                elif len(authority) == 5:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_authority = authority[2][0].upper() + authority[2][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Полномочие", f'{authority[0]} абзац {authority[1]}',
+                                         f'{text_authority} {authority[3][:-1]}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'authority - Полномочие {authority[0]} абзац {authority[1]}'
+                                                   f' {text_authority} {authority[3][:-1]}.\n')
+        elif key == 'Задачи' and (dut_o_boss_type == 6 or dut_o_boss_type == 7 or dut_o_boss_type == 8):
+            # Функция, дополняющая нумерацию
+            data_from_tasks = tasks(moduls_doc[key])
+            for task in data_from_tasks:
+                # Перевод первой буквы первого слова в заглавную форму
+                text_task = task[1][0].upper() + task[1][1:]
+                # Добавление в массив array_duties
+                array_duties.append(["Задача", task[0], f"{text_task}."])
+                # Запись в файл
+                info_analayser_doc_lines.write(f'task - Задача {task[0]} {text_task}.\n')
+        elif key == 'Функции' and (dut_o_boss_type == 6 or dut_o_boss_type == 7 or dut_o_boss_type == 8):
+            # Функция, дополняющая нумерацию
+            data_from_func = functions(moduls_doc[key])
+            for function in data_from_func:
+                if len(function) == 3 or len(function) == 5:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_function = function[1][0].upper() + function[1][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Функция", function[0], f'{text_function}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'function - Функция {function[0]} {text_function}.\n')
+                elif len(function) == 7:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_function = function[3][0].upper() + function[3][1:-1]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Функция", f'{function[0]} абзац {function[1]}', f'{text_function}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'function - Функция {function[0]} абзац {function[1]}'
+                                                   f' {text_function}.\n')
+                elif len(function) == 9:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_function = function[4][0].upper() + function[4][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Функция", f'{function[0]} абзац {function[1]} подабзац {function[2]}',
+                                         f'{text_function} {function[5][:-1]}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'function - Функция {function[0]} абзац {function[1]} подабзац '
+                                                   f'{function[2]} {text_function} {function[5][:-1]}.\n')
+                elif len(function) == 11:
+                    # Перевод первой буквы первого слова в заглавную форму
+                    text_function = function[5][0].upper() + function[5][1:]
+                    # Добавление в массив array_duties
+                    array_duties.append(["Функция",
+                                         f'{function[0]} абзац {function[1]} подабзац {function[2]} пункт '
+                                         f'{function[3]}', f'{text_function} {function[6]} {function[7][:-1]}.'])
+                    # Запись в файл
+                    info_analayser_doc_lines.write(f'function - Функция {function[0]} абзац {function[1]} подабзац '
+                                                   f'{function[2]} пункт {function[3]} {text_function} '
+                                                   f'{function[6]} {function[7][:-1]}.\n')
+    # Закрытие файла с всеми распознанными полномочиями, обязанностями, задачами, функциями
+    info_analayser_doc_lines.close()
+
+    # Вариант вывода результатов №2 - в консоль.
+    # for key in moduls_doc:
+    #     if key == 'Обязанности' and (dut_o_boss_type == 5 or dut_o_boss_type == 9):
+    #         # print(f'modul |{key: <20}| from moduls_docs:')
+    #         data_from_resp = responsibilities(moduls_doc[key])
+    #         for resp in data_from_resp:
+    #             if len(resp) == 5:
+    #                 print(f'Обязанность {resp[0]} {resp[1]}')
+    #             elif len(resp) == 7:
+    #                 print(f'Обязанность {resp[0]} абзац {resp[1]} {resp[2]} {resp[3]}')
+    #             elif len(resp) == 9:
+    #                 print(f'Обязанность {resp[0]} абзац {resp[1]} подабзац {resp[2]} {resp[3]} {resp[4]} {resp[5]}')
+    #         print(f"{Bcolors.CYAN}Распознано {data_from_resp[-1][-1]} обязанностей{Bcolors.ENDC}")
+    #     elif key == 'Полномочия' and dut_o_boss_type == 3:
+    #         # print(f'modul |{key: <20}| from moduls_docs:')
+    #         data_from_auth = authorities(moduls_doc[key])
+    #         for authority in data_from_auth:
+    #             if len(authority) == 3:
+    #                 print(f'Полномочие {authority[0]} {authority[1]}')
+    #             elif len(authority) == 5:
+    #                 print(f'Полномочие {authority[0]} абзац {authority[1]} {authority[2]} {authority[3]}')
+    #         print(f"{Bcolors.CYAN}Распознано {data_from_auth[-1][-1]} полномочий{Bcolors.ENDC}")
+    #     elif key == 'Задачи' and (dut_o_boss_type == 6 or dut_o_boss_type == 7 or dut_o_boss_type == 8):
+    #         # print(f'modul |{key: <20}| from moduls_docs:')
+    #         data_from_tasks = tasks(moduls_doc[key])
+    #         for task in data_from_tasks:
+    #             print(f"Задача {task[0]} {task[1]}")
+    #         print(f"{Bcolors.CYAN}Распознано {data_from_tasks[-1][-1]} задач{Bcolors.ENDC}")
+    #         print(f"{Bcolors.OKGREEN}{'-' * 80}{Bcolors.ENDC}")
+    #     elif key == 'Функции' and (dut_o_boss_type == 6 or dut_o_boss_type == 7 or dut_o_boss_type == 8):
+    #         # print(f'modul |{key: <20}| from moduls_docs:')
+    #         data_from_func = functions(moduls_doc[key])
+    #         for function in data_from_func:
+    #             if len(function) == 3 or len(function) == 5:
+    #                 print(f'Функция {function[0]} {function[1]}')
+    #             elif len(function) == 7:
+    #                 print(f'Функция {function[0]} абзац {function[1]} {function[3]}')
+    #             elif len(function) == 9:
+    #                 print(f'Функция {function[0]} абзац {function[1]} подабзац '
+    #                       f'{function[2]} {function[4]} {function[5]}')
+    #             elif len(function) == 11:
+    #                 print(f'Функция {function[0]} абзац {function[1]} подабзац {function[2]} пункт {function[3]} '
+    #                       f'{function[5]} {function[6]} {function[7]}')
+    #         print(f"{Bcolors.CYAN}Распознано {data_from_func[-1][-1]} функций{Bcolors.ENDC}")
+    #         print(f"{Bcolors.OKGREEN}{'-' * 80}{Bcolors.ENDC}")
